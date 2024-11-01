@@ -112,13 +112,13 @@ Run the script with or without arguments:
 ```bash
 ./cloudflare-dns-update.sh your.domain.com
 ```
-Options
+### Options
 - `-h`, `--help`: Display the help message.
 
 ```bash
 ./cloudflare-dns-update.sh -h
 ```
-Examples
+## Examples
 - Update DNS Record for a Specific Domain:
 
 ```bash
