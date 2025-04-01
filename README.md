@@ -50,7 +50,7 @@ sudo apt-get install curl jq
 sudo yum install curl jq
 ```
 ## Installation
-Clone the Repository:
+### Option 1: Clone the Repository:
 
 ```bash
 git clone https://github.com/yourusername/cloudflare-dns-update-script.git
@@ -60,6 +60,14 @@ Make the Script Executable:
 
 ```bash
 chmod +x cloudflare-dns-update.sh
+```
+### Option 2: Single-Line Installation
+Use a single command to download and install the script into /usr/local/bin:
+```bash
+sudo -v && curl -sSL \
+  https://github.com/PrimeSeventyThree/cloudflare-updater/raw/refs/heads/main/cloudflare-dns-update.sh \
+  | sudo tee /usr/local/bin/cloudflare-dns-update.sh >/dev/null \
+  && sudo chmod +x /usr/local/bin/cloudflare-dns-update.sh
 ```
 ## Configuration
 Create the Configuration File
