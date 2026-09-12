@@ -58,6 +58,9 @@ fi
 # Default configuration file path
 DEFAULT_CONFIG_FILE="$HOME/.cloudflare-config.env"
 
+# Default: no GCP firewall rules to sync (override as an array in the config file)
+declare -a GCP_FIREWALL_RULES=()
+
 ###########################################
 # Functions
 ###########################################
@@ -106,6 +109,10 @@ ${BOLD}Optional variables in the configuration file:${RESET}
   ${CYAN}SLACK_CHANNEL${RESET}     Slack channel for notifications.
   ${CYAN}SLACK_URI${RESET}         Slack Webhook URL for notifications.
   ${CYAN}DISCORD_URI${RESET}       Discord Webhook URL for notifications.
+  ${CYAN}GCP_FIREWALL_RULES${RESET}  Bash array of "project:rule-name" pairs. For each entry, the
+                       rule's --source-ranges is synced to the current public IP (/32),
+                       replacing whatever was there before. Requires the gcloud CLI to be
+                       installed and authenticated with permission to update the rule.
 
 ${BOLD}Example Configuration File:${RESET}
 
@@ -125,6 +132,7 @@ ${BOLD}Example Configuration File:${RESET}
   export SLACK_CHANNEL="#notifications"
   export SLACK_URI="https://hooks.slack.com/services/your/slack/webhook"
   export DISCORD_URI="https://discordapp.com/api/webhooks/your/discord/webhook"
+  export GCP_FIREWALL_RULES=("your-gcp-project:your-firewall-rule-name")
 
 ${BOLD}Instructions:${RESET}
 
@@ -237,6 +245,51 @@ send_notification() {
   fi
 }
 
+update_gcp_firewall_rules() {
+  local ip="$1"
+  local cidr="${ip}/32"
+
+  if [[ ${#GCP_FIREWALL_RULES[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  if ! command -v gcloud >/dev/null 2>&1; then
+    log_error "gcloud is not installed; skipping GCP firewall rule updates."
+    return 1
+  fi
+
+  local entry project rule current_ranges
+  for entry in "${GCP_FIREWALL_RULES[@]}"; do
+    project="${entry%%:*}"
+    rule="${entry#*:}"
+
+    if [[ -z "$project" || -z "$rule" || "$project" == "$entry" ]]; then
+      log_error "Invalid GCP_FIREWALL_RULES entry '$entry'. Expected format 'project:rule-name'."
+      continue
+    fi
+
+    current_ranges=$(gcloud compute firewall-rules describe "$rule" \
+      --project "$project" \
+      --format="value(sourceRanges)" 2>/dev/null) || {
+      log_error "Failed to read firewall rule '$rule' in project '$project'."
+      continue
+    }
+
+    if [[ "$current_ranges" == "$cidr" ]]; then
+      log_info "Firewall rule '$rule' in '$project' already allows $cidr."
+      continue
+    fi
+
+    if gcloud compute firewall-rules update "$rule" \
+      --project "$project" \
+      --source-ranges "$cidr" >/dev/null 2>&1; then
+      log_info "Firewall rule '$rule' in '$project' updated: ${current_ranges:-none} -> $cidr"
+    else
+      log_error "Failed to update firewall rule '$rule' in project '$project'."
+    fi
+  done
+}
+
 ###########################################
 # Main Script
 ###########################################
@@ -340,6 +393,12 @@ if [[ -z "$ip" ]]; then
 fi
 
 validate_ip "$ip"
+
+###########################################
+# Sync GCP Firewall Rules (optional)
+###########################################
+
+update_gcp_firewall_rules "$ip"
 
 ###########################################
 # Fetch Existing DNS Record

@@ -16,6 +16,7 @@ This script updates a Cloudflare DNS A record with the public IP address of the 
 - [Notifications](#notifications)
   - [Slack Notification](#slack-notification)
   - [Discord Notification](#discord-notification)
+- [GCP Firewall Rule Sync](#gcp-firewall-rule-sync)
 - [Security Considerations](#security-considerations)
 - [Troubleshooting](#troubleshooting)
 - [Contributing](#contributing)
@@ -98,6 +99,9 @@ export SITE_NAME="My Site"                       # For notifications
 export SLACK_CHANNEL="#notifications"            # Slack channel name
 export SLACK_URI="https://hooks.slack.com/services/your/slack/webhook"
 export DISCORD_URI="https://discord.com/api/webhooks/your/discord/webhook"
+
+# Optional: keep GCP VPC firewall rules pointed at your current IP
+export GCP_FIREWALL_RULES=("your-gcp-project:your-firewall-rule-name")
 ```
 Replace the placeholder values with your actual information.
 
@@ -161,6 +165,33 @@ To receive Discord notifications:
 ```bash
 export DISCORD_URI="https://discord.com/api/webhooks/your/discord/webhook"
 ```
+## GCP Firewall Rule Sync
+In addition to updating DNS, the script can keep one or more GCP VPC firewall rules restricted to your current public IP — replacing `--source-ranges` with `<ip>/32`, the same way you'd run:
+
+```bash
+gcloud compute firewall-rules update vless-reality-01-allow-ssh \
+  --project destiny-297022 \
+  --source-ranges 76.71.239.72/32
+```
+
+This is disabled unless you set `GCP_FIREWALL_RULES` in your configuration file, as a Bash array of `"project:rule-name"` pairs:
+
+```bash
+export GCP_FIREWALL_RULES=("destiny-297022:vless-reality-01-allow-ssh")
+
+# Multiple rules and/or projects are supported:
+export GCP_FIREWALL_RULES=(
+  "destiny-297022:vless-reality-01-allow-ssh"
+  "another-project:another-rule"
+)
+```
+
+Notes:
+- GCP firewall rules are project-scoped, not zone-scoped — there's no `--zone` flag on `gcloud compute firewall-rules update`, so only project + rule name are needed.
+- The rule's current `sourceRanges` is checked first; if it already matches `<ip>/32`, no API call is made.
+- Requires the [`gcloud` CLI](https://cloud.google.com/sdk/docs/install) to be installed and already authenticated (e.g. `gcloud auth login` or a service account) with permission to update the rule (`compute.firewalls.update`).
+- This check runs independently of the Cloudflare DNS comparison, so it self-corrects even if a previous run updated DNS but failed to update the firewall rule.
+
 ## Security Considerations
 - Protect Your API Keys:
 
