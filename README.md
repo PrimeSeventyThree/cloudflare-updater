@@ -170,18 +170,18 @@ In addition to updating DNS, the script can keep one or more GCP VPC firewall ru
 
 ```bash
 gcloud compute firewall-rules update vless-reality-01-allow-ssh \
-  --project destiny-297022 \
-  --source-ranges 76.71.239.72/32
+  --project [PROJECT_ID] \
+  --source-ranges [IP_ADDRESS]/32
 ```
 
 This is disabled unless you set `GCP_FIREWALL_RULES` in your configuration file, as a Bash array of `"project:rule-name"` pairs:
 
 ```bash
-export GCP_FIREWALL_RULES=("destiny-297022:vless-reality-01-allow-ssh")
+export GCP_FIREWALL_RULES=("[PROJECT_ID]:[FIREWALL_RULE_ID]")
 
 # Multiple rules and/or projects are supported:
 export GCP_FIREWALL_RULES=(
-  "destiny-297022:vless-reality-01-allow-ssh"
+  "[PROJECT_ID]:[FIREWALL_RULE_ID]"
   "another-project:another-rule"
 )
 ```
