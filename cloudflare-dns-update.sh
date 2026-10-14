@@ -6,7 +6,7 @@
 
 # Author: Andrei Grichine (andrei.grichine@gmail.com)
 # Created: Wednesday, 16th October 2024 6:41:31 PM
-# Last Modified: Friday, 1st November 2024 9:15:11 AM
+# Last Modified: Saturday, 10th October 2026 10:34:43 am
 
 # License: MIT License (see LICENSE file in the project root for full license)
 
@@ -248,6 +248,7 @@ send_notification() {
 update_gcp_firewall_rules() {
   local ip="$1"
   local cidr="${ip}/32"
+  local failures=0
 
   if [[ ${#GCP_FIREWALL_RULES[@]} -eq 0 ]]; then
     return 0
@@ -258,36 +259,40 @@ update_gcp_firewall_rules() {
     return 1
   fi
 
-  local entry project rule current_ranges
+  local entry project rule current_ranges err
   for entry in "${GCP_FIREWALL_RULES[@]}"; do
     project="${entry%%:*}"
     rule="${entry#*:}"
 
     if [[ -z "$project" || -z "$rule" || "$project" == "$entry" ]]; then
       log_error "Invalid GCP_FIREWALL_RULES entry '$entry'. Expected format 'project:rule-name'."
+      failures=$((failures + 1))
       continue
     fi
 
-    current_ranges=$(gcloud compute firewall-rules describe "$rule" \
+    if ! current_ranges=$(gcloud compute firewall-rules describe "$rule" \
       --project "$project" \
-      --format="value(sourceRanges)" 2>/dev/null) || {
-      log_error "Failed to read firewall rule '$rule' in project '$project'."
+      --format="value(sourceRanges)" 2>&1); then
+      log_error "Failed to read firewall rule '$rule' in project '$project': $current_ranges"
+      failures=$((failures + 1))
       continue
-    }
+    fi
 
     if [[ "$current_ranges" == "$cidr" ]]; then
       log_info "Firewall rule '$rule' in '$project' already allows $cidr."
       continue
     fi
 
-    if gcloud compute firewall-rules update "$rule" \
+    if err=$(gcloud compute firewall-rules update "$rule" \
       --project "$project" \
-      --source-ranges "$cidr" >/dev/null 2>&1; then
+      --source-ranges "$cidr" 2>&1); then
       log_info "Firewall rule '$rule' in '$project' updated: ${current_ranges:-none} -> $cidr"
     else
-      log_error "Failed to update firewall rule '$rule' in project '$project'."
+      log_error "Failed to update firewall rule '$rule' in project '$project': $err"
+      failures=$((failures + 1))
     fi
   done
+  [[ $failures -eq 0 ]]
 }
 
 ###########################################
@@ -398,7 +403,8 @@ validate_ip "$ip"
 # Sync GCP Firewall Rules (optional)
 ###########################################
 
-update_gcp_firewall_rules "$ip"
+gcp_status=0
+update_gcp_firewall_rules "$ip" || gcp_status=1
 
 ###########################################
 # Fetch Existing DNS Record
@@ -430,7 +436,7 @@ old_ip=$(echo "$record_response" | jq -r '.result[0].content')
 
 if [[ "$ip" == "$old_ip" ]]; then
   log_info "IP address has not changed. Current IP is $ip."
-  exit 0
+  exit "$gcp_status"
 fi
 
 ###########################################
@@ -444,7 +450,7 @@ if [[ "$(echo "$update_response" | jq -r '.success')" == "true" ]]; then
   log_info "DNS record updated to $ip for $record_name."
   message="${SITE_NAME:-Site} Updated: $record_name new IP Address is $ip"
   send_notification "$message"
-  exit 0
+  exit "$gcp_status"
 else
   log_error "Failed to update DNS record."
   log_error "Response: $update_response"
