@@ -6,7 +6,7 @@
 
 # Author: Andrei Grichine (andrei.grichine@gmail.com)
 # Created: Wednesday, 16th October 2024 6:41:31 PM
-# Last Modified: Saturday, 10th October 2026 10:34:43 am
+# Last Modified: Monday, 9th November 2026
 
 # License: MIT License (see LICENSE file in the project root for full license)
 
@@ -20,6 +20,8 @@
 # - Initial creation of the script.
 # - Added error handling and logging.
 # - Integrated notification support via Slack and Discord.
+# - 2026-11-09: skip gcloud and the Cloudflare API while the public IP is unchanged (rechecked hourly), several
+#   records per run, a lock against overlapping runs.
 
 
 # Exit immediately if a command exits with a non-zero status,
@@ -74,13 +76,13 @@ This script updates a Cloudflare DNS A record with the public IP address of the 
 It's useful for maintaining a dynamic DNS setup.
 
 ${BOLD}Usage:${RESET}
-  $0 [options] [domain]
+  $0 [options] [domain ...]
 
 ${BOLD}Options:${RESET}
   -h, --help        Show this help message and exit.
 
 ${BOLD}Arguments:${RESET}
-  domain            (Optional) The DNS record to update. If not provided, the script will use CF_RECORD_NAME or DEFAULT_DOMAIN from the configuration file.
+  domain ...        (Optional) One or more DNS records to update. If not provided, the script will use CF_RECORD_NAME or DEFAULT_DOMAIN from the configuration file.
 
 ${BOLD}Configuration:${RESET}
   The script requires a configuration file to set up necessary environment variables.
@@ -348,12 +350,14 @@ done
 # Handle Command-Line Arguments
 ###########################################
 
+# One or more DNS records per run. The public IP lookup and the GCP firewall check are shared, so list every record
+# in one cron line rather than one cron line per record.
 if [[ $# -ge 1 ]]; then
-  record_name="$1"
+  record_names=("$@")
 elif [[ -n "${CF_RECORD_NAME:-}" ]]; then
-  record_name="$CF_RECORD_NAME"
+  record_names=("$CF_RECORD_NAME")
 elif [[ -n "${DEFAULT_DOMAIN:-}" ]]; then
-  record_name="$DEFAULT_DOMAIN"
+  record_names=("$DEFAULT_DOMAIN")
 else
   log_error "No domain name provided. Use a command-line argument, or set CF_RECORD_NAME or DEFAULT_DOMAIN."
   print_help
@@ -361,13 +365,15 @@ else
 fi
 
 ###########################################
-# Validate Domain Name
+# Validate Domain Names
 ###########################################
 
-if ! [[ "$record_name" =~ ^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$ ]]; then
-  log_error "Invalid domain name '$record_name'."
-  exit 1
-fi
+for record_name in "${record_names[@]}"; do
+  if ! [[ "$record_name" =~ ^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$ ]]; then
+    log_error "Invalid domain name '$record_name'."
+    exit 1
+  fi
+done
 
 ###########################################
 # Set Authentication Headers
@@ -388,6 +394,45 @@ else
 fi
 
 ###########################################
+# State: last confirmed IP per target, and a lock
+###########################################
+
+# Each target (the GCP firewall rules, each DNS record) remembers the IP it was last confirmed at. While the public
+# IP stays the same, the script skips gcloud and the Cloudflare API. It rechecks them anyway once the confirmation
+# is CF_RECHECK_SECONDS old (default 3600), so a change made elsewhere (console, another host) is corrected.
+STATE_DIR="${CF_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/cloudflare-ddns}"
+: "${CF_RECHECK_SECONDS:=3600}"
+mkdir -p "$STATE_DIR"
+
+# One run at a time: a slow gcloud call must not let runs pile up behind it. Uses flock where it exists (Linux);
+# without it (macOS) runs aren't serialised, which only matters when a run takes longer than the cron interval.
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$STATE_DIR/lock"
+  if ! flock -n 9; then
+    log_info "Another run is in progress; skipping."
+    exit 0
+  fi
+fi
+
+# mtime FILE: modification time in epoch seconds (GNU stat, then BSD/macOS stat).
+mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"
+}
+
+# is_current TARGET IP: true when TARGET was confirmed at IP less than CF_RECHECK_SECONDS ago.
+is_current() {
+  local file="$STATE_DIR/$1.ip" age
+  [[ -f "$file" && "$(cat "$file")" == "$2" ]] || return 1
+  age=$(( $(date +%s) - $(mtime "$file") ))
+  (( age < CF_RECHECK_SECONDS ))
+}
+
+# mark_current TARGET IP
+mark_current() {
+  printf '%s\n' "$2" > "$STATE_DIR/$1.ip"
+}
+
+###########################################
 # Get Public IP
 ###########################################
 
@@ -404,57 +449,72 @@ validate_ip "$ip"
 ###########################################
 
 gcp_status=0
-update_gcp_firewall_rules "$ip" || gcp_status=1
-
-###########################################
-# Fetch Existing DNS Record
-###########################################
-
-record_response=$(fetch_dns_record)
-
-# Check if the request was successful
-if [[ "$(echo "$record_response" | jq -r '.success')" != "true" ]]; then
-  log_error "Failed to fetch DNS records."
-  log_error "Response: $record_response"
-  exit 1
-fi
-
-# Check if the record exists
-record_count=$(echo "$record_response" | jq '.result | length')
-if [[ "$record_count" -eq 0 ]]; then
-  log_error "DNS record for '$record_name' does not exist."
-  exit 1
-fi
-
-# Extract record ID and current IP
-record_identifier=$(echo "$record_response" | jq -r '.result[0].id')
-old_ip=$(echo "$record_response" | jq -r '.result[0].content')
-
-###########################################
-# Compare IP Addresses
-###########################################
-
-if [[ "$ip" == "$old_ip" ]]; then
-  log_info "IP address has not changed. Current IP is $ip."
-  exit "$gcp_status"
+if [[ ${#GCP_FIREWALL_RULES[@]} -gt 0 ]]; then
+  # The state key includes the rule list, so editing GCP_FIREWALL_RULES forces a fresh check.
+  gcp_key="gcp-$(printf '%s\n' "${GCP_FIREWALL_RULES[@]}" | cksum | cut -d" " -f1)"
+  if is_current "$gcp_key" "$ip"; then
+    log_info "GCP firewall rules already confirmed for $ip; gcloud skipped."
+  elif update_gcp_firewall_rules "$ip"; then
+    mark_current "$gcp_key" "$ip"
+  else
+    gcp_status=1
+  fi
 fi
 
 ###########################################
-# Update DNS Record
+# Sync DNS Records
 ###########################################
 
-update_response=$(update_dns_record "$record_identifier" "$ip")
+# sync_record: brings the A record "$record_name" to "$ip". Returns non-zero on failure, so one failing record
+# doesn't stop the others. (errexit is off inside a function called from "||", so every step is checked here.)
+sync_record() {
+  local record_response record_count record_identifier old_ip update_response message
 
-# Check if the update was successful
-if [[ "$(echo "$update_response" | jq -r '.success')" == "true" ]]; then
-  log_info "DNS record updated to $ip for $record_name."
-  message="${SITE_NAME:-Site} Updated: $record_name new IP Address is $ip"
-  send_notification "$message"
-  exit "$gcp_status"
-else
-  log_error "Failed to update DNS record."
-  log_error "Response: $update_response"
+  if is_current "dns-$record_name" "$ip"; then
+    log_info "$record_name already confirmed at $ip; Cloudflare skipped."
+    return 0
+  fi
+
+  if ! record_response=$(fetch_dns_record) ||
+     [[ "$(echo "$record_response" | jq -r '.success')" != "true" ]]; then
+    log_error "Failed to fetch DNS records for '$record_name'."
+    log_error "Response: $record_response"
+    return 1
+  fi
+
+  record_count=$(echo "$record_response" | jq '.result | length')
+  if [[ "$record_count" -eq 0 ]]; then
+    log_error "DNS record for '$record_name' does not exist."
+    return 1
+  fi
+
+  record_identifier=$(echo "$record_response" | jq -r '.result[0].id')
+  old_ip=$(echo "$record_response" | jq -r '.result[0].content')
+
+  if [[ "$ip" == "$old_ip" ]]; then
+    log_info "IP address has not changed for $record_name. Current IP is $ip."
+    mark_current "dns-$record_name" "$ip"
+    return 0
+  fi
+
+  if update_response=$(update_dns_record "$record_identifier" "$ip") &&
+     [[ "$(echo "$update_response" | jq -r '.success')" == "true" ]]; then
+    log_info "DNS record updated to $ip for $record_name."
+    mark_current "dns-$record_name" "$ip"
+    message="${SITE_NAME:-Site} Updated: $record_name new IP Address is $ip"
+    send_notification "$message"
+    return 0
+  fi
+
+  log_error "Failed to update DNS record for '$record_name'."
+  log_error "Response: ${update_response:-}"
   message="${SITE_NAME:-Site} DDNS Update Failed: $record_name ($ip)"
   send_notification "$message"
-  exit 1
-fi
+  return 1
+}
+
+rc=$gcp_status
+for record_name in "${record_names[@]}"; do
+  sync_record || rc=1
+done
+exit "$rc"

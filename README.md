@@ -17,6 +17,8 @@ This script updates a Cloudflare DNS A record with the public IP address of the 
   - [Slack Notification](#slack-notification)
   - [Discord Notification](#discord-notification)
 - [GCP Firewall Rule Sync](#gcp-firewall-rule-sync)
+- [Skipping Unchanged IPs](#skipping-unchanged-ips)
+- [Running from Cron](#running-from-cron)
 - [Security Considerations](#security-considerations)
 - [Troubleshooting](#troubleshooting)
 - [Contributing](#contributing)
@@ -24,7 +26,8 @@ This script updates a Cloudflare DNS A record with the public IP address of the 
 
 ## Features
 
-- Updates a Cloudflare DNS A record with the current public IP address.
+- Updates one or more Cloudflare DNS A records with the current public IP address.
+- Remembers the last confirmed IP, so runs where nothing changed make no Cloudflare or `gcloud` calls (rechecked hourly).
 - Supports both Global API Key and API Token authentication methods.
 - Validates domain names and IP addresses.
 - Provides detailed error handling and informative messages.
@@ -40,6 +43,7 @@ This script updates a Cloudflare DNS A record with the public IP address of the 
 - **Dependencies**:
   - `curl`
   - `jq`
+  - `flock` (optional, part of util-linux on Linux): keeps runs from overlapping. Without it (macOS) the script still works, but runs aren't serialised.
 
 Ensure that these dependencies are installed on your system:
 
@@ -124,6 +128,11 @@ Run the script with or without arguments:
 ```bash
 ./cloudflare-dns-update.sh your.domain.com
 ```
+- With several domains: updates each record in one run. The public IP lookup and the GCP firewall check happen once. A failure on one record doesn't stop the others, and the exit status is non-zero if any failed.
+
+```bash
+./cloudflare-dns-update.sh your.domain.com other.domain.com
+```
 ### Options
 - `-h`, `--help`: Display the help message.
 
@@ -191,6 +200,35 @@ Notes:
 - The rule's current `sourceRanges` is checked first; if it already matches `<ip>/32`, no API call is made.
 - Requires the [`gcloud` CLI](https://cloud.google.com/sdk/docs/install) to be installed and already authenticated (e.g. `gcloud auth login` or a service account) with permission to update the rule (`compute.firewalls.update`).
 - This check runs independently of the Cloudflare DNS comparison, so it self-corrects even if a previous run updated DNS but failed to update the firewall rule.
+- `gcloud` is slow to start (often several seconds of CPU per call, about a minute on older hardware). The script calls it only when the public IP changes or the hourly recheck is due (see [Skipping Unchanged IPs](#skipping-unchanged-ips)).
+- For cron use, turn off gcloud's usage reporting. Otherwise each call also starts a `metrics_reporter.py` process:
+
+```bash
+gcloud config set disable_usage_reporting true
+```
+
+## Skipping Unchanged IPs
+Each target (the set of GCP firewall rules, and each DNS record) remembers the IP it was last confirmed at, in a small state file. While the public IP stays the same, a run only looks up the public IP and exits. It makes no Cloudflare API calls and starts no `gcloud`.
+
+Each target is checked against the real record again once its confirmation is older than `CF_RECHECK_SECONDS`, so a change made elsewhere (in the Cloudflare dashboard, the GCP console or from another host) is corrected. Changing `GCP_FIREWALL_RULES` forces a fresh firewall check.
+
+Optional settings (environment or configuration file):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CF_RECHECK_SECONDS` | `3600` | Maximum age of a confirmation before the target is checked again |
+| `CF_STATE_DIR` | `${XDG_STATE_HOME:-~/.local/state}/cloudflare-ddns` | Where the state files and the lock live |
+
+To force a full check on the next run, delete the state files: `rm ~/.local/state/cloudflare-ddns/*.ip`.
+
+## Running from Cron
+Run every record from one cron line, so the IP lookup and the firewall check are shared:
+
+```bash
+* * * * * /path/to/cloudflare-dns-update.sh your.domain.com other.domain.com >/dev/null || echo "cloudflare-dns-update failed" >&2
+```
+
+Running every minute is cheap now: an unchanged run is one HTTPS request. With `flock` installed, a run that starts while another is still busy exits straight away.
 
 ## Security Considerations
 - Protect Your API Keys:
@@ -224,6 +262,8 @@ chmod +x cloudflare-dns-update.sh
 - Cron Job Issues:
 
   - When running the script via cron, make sure to use absolute paths for both the script and the configuration file.
+
+  - Cron's `PATH` is short. If you use the GCP firewall sync, add the `gcloud` directory to `PATH` in the crontab.
 
   - Redirect output to a log file to capture any errors:
 
